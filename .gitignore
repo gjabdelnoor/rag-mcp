@@ -1,0 +1,15 @@
+# built index + caches (generated data, not source)
+index/
+collections.json
+
+# python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# scratch
+*.tmp
+*.log
+*.err

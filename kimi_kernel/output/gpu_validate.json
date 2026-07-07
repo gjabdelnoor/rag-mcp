@@ -1,0 +1,35 @@
+{
+  "still_720": {
+    "stock_dt_s": 1.5612258911132812,
+    "matmul_dt_s": 0.39624500274658203,
+    "cos_stock_vs_matmul": 1.0,
+    "ok": true
+  },
+  "video_W=8_#1": {
+    "stock_dt_s": 14.14734148979187,
+    "matmul_dt_s": 7.2907679080963135,
+    "n_frames": 8,
+    "fps_stock": 0.5654772669319155,
+    "fps_matmul": 1.097278105796797,
+    "cos_stock_vs_matmul": 1.0,
+    "ok": true
+  },
+  "video_W=8_#2": {
+    "stock_dt_s": 14.395689249038696,
+    "matmul_dt_s": 7.3076560497283936,
+    "n_frames": 8,
+    "fps_stock": 0.555721915193065,
+    "fps_matmul": 1.09474227379617,
+    "cos_stock_vs_matmul": 1.0009765625,
+    "ok": true
+  },
+  "video_W16": {
+    "stock_dt_s": 14.679002523422241,
+    "matmul_dt_s": 7.608442068099976,
+    "n_frames": 16,
+    "fps_stock": 1.089992318924255,
+    "fps_matmul": 2.102927229620822,
+    "cos_stock_vs_matmul": 1.0,
+    "ok": true
+  }
+}

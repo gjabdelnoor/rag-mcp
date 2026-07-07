@@ -1,0 +1,10 @@
+{
+  "STATF401": {
+    "folder": "/home/gabriel/Documents/STATF401/Materials",
+    "description": "STAT-F401 course materials: lecture transcripts, lecture slides (OCR'd), and the Weisberg *Applied Linear Regression* textbook. Ask here for anything about the statistics/regression class."
+  },
+  "workbook": {
+    "folder": "/home/gabriel/Documents/Gabe's Workbook",
+    "description": "Gabe's Workbook: general scientific papers, technical notes, and scripts collected for reference. Ask here for research papers and general science/engineering material not tied to a specific course."
+  }
+}
