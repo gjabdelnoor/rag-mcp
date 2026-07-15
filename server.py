@@ -29,16 +29,41 @@ Tools:
 import os, json, time, threading
 from mcp.server.fastmcp import FastMCP, Image
 from worker_client import Embedder
+from text_embedder_client import TextEmbedder
 from index_store import IndexStore
 import rag_collections
+import dgpu_embed_ctl as dctl
 
 IDLE_SECONDS = int(os.environ.get("RAG_IDLE", "900"))   # 15 min
-INGEST_VERSION = 3                                       # 3 = OCR'd PDFs (raw HTML)
+INGEST_VERSION = 4                                       # 4 = dual store (text + image)
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp"}          # indexed still images
 
 COLLECTIONS = rag_collections.load()
-stores = {name: IndexStore(c["index_dir"]) for name, c in COLLECTIONS.items()}
+# Dual store: each collection gets a TEXT store (PDF/text/epub chunks, embed
+# via `ingest_emb` on the 7700S dGPU) and an IMAGE store (raster images,
+# also via the 7700S). Both are bare IndexStore instances — they don't know
+# which collection they belong to.
+text_stores = {name: IndexStore(os.path.join(c["index_dir"], "text"))
+               for name, c in COLLECTIONS.items()}
+image_stores = {name: IndexStore(os.path.join(c["index_dir"], "image"))
+                for name, c in COLLECTIONS.items()}
 
+# Policy (as of 2026-07-08): the 780M iGPU is reserved for INFERENCE (query
+# embedding during `search` — small, latency-sensitive, one vector at a
+# time). ALL bulk embedding work (document ingest, both text and image) runs
+# on the 7700S dGPU, which is 10-30x faster for batched work (see
+# dgpu_embed_ctl.py bench-all). Three embedders, one shared lock since two of
+# them (ingest_emb, emb) share the 7700S and must never run concurrently:
+#   text_emb   — nomic-embed-text-v1.5 on the 780M iGPU (Vulkan0). SEARCH ONLY.
+#   ingest_emb — the same nomic model but on the 7700S dGPU (Vulkan1), at the
+#                `xlarge` preset (ctx/batch/ubatch=8192, 4 parallel slots —
+#                the fastest config found by `dgpu_embed_ctl bench-all`).
+#                Used for ALL text/pdf/epub ingest.
+#   emb        — the existing Qwen3-VL-Embedding-2B worker, also on the 7700S
+#                dGPU; used for raster-image ingest. Mutually exclusive with
+#                ingest_emb (both claim the 7700S) — enforced via `_lock`.
+text_emb = TextEmbedder()
+ingest_emb = dctl._make_embedder("xlarge", dctl.DEFAULT_PORT)
 emb = Embedder()
 _last_used = [0.0]
 _lock = threading.Lock()          # guards embedder start/stop + OCR prepass
@@ -53,28 +78,69 @@ def _touch():
     _last_used[0] = time.time()
 
 
-def _ensure_warm():
+def _ensure_warm_text():
+    """Cold-start the small text embedder on the 780M if needed. SEARCH ONLY
+    — see the module docstring policy note; ingest never touches this one."""
+    with _lock:
+        _touch()
+        cold = not text_emb.alive
+        if cold:
+            text_emb.start()
+    return cold
+
+
+def _ensure_warm_ingest_text():
+    """Cold-start the 7700S text embedder (`ingest_emb`, `xlarge` preset) for
+    document ingest. Shares the 7700S with the image embedder `emb` — stop
+    that first if it's warm, one heavy Vulkan user at a time on this GPU."""
+    with _lock:
+        _touch()
+        cold = not ingest_emb.alive
+        if cold:
+            if emb.alive:
+                emb.stop()
+            dctl.wait_for_dgpu_idle(quiet=True)
+            ingest_emb.start()
+    return cold
+
+
+def _ensure_warm_image():
+    """Cold-start the big VL-2B embedder on the 7700S if needed (image ingest
+    only — text ingest goes through `_ensure_warm_ingest_text`, search
+    through `_ensure_warm_text`). Shares the 7700S with `ingest_emb`."""
     with _lock:
         _touch()
         cold = not emb.alive
         if cold:
+            if ingest_emb.alive:
+                ingest_emb.stop()
+            dctl.wait_for_dgpu_idle(quiet=True)
             emb.start()
     return cold
 
 
 def _collection(name):
-    """Resolve a collection name to (name, store, config); default when there is
-    exactly one collection or none is given."""
+    """Resolve a collection name to (name, text_store, config); default when
+    there is exactly one collection or none is given. PDF/EPUB text chunks live
+    in `text_store` so existing tools (`get_book_image`, `screenshot_video`,
+    `search`) keep working against `text_store.sources()` unchanged."""
     if not name:
-        if len(stores) == 1:
-            name = next(iter(stores))
+        if len(text_stores) == 1:
+            name = next(iter(text_stores))
         else:
             raise ValueError("specify `collection` — one of: "
-                             + ", ".join(stores))
-    if name not in stores:
+                             + ", ".join(text_stores))
+    if name not in text_stores:
         raise ValueError(f"unknown collection {name!r}; one of: "
-                         + ", ".join(stores))
-    return name, stores[name], COLLECTIONS[name]
+                         + ", ".join(text_stores))
+    return name, text_stores[name], COLLECTIONS[name]
+
+
+def _image_store(name):
+    """Look up the IMAGE half of a collection. Returns None for unknown
+    collection names (callers that need to raise should validate via
+    `_collection` first)."""
+    return image_stores.get(name)
 
 
 def _fmt_ts(t):
@@ -119,12 +185,19 @@ def _save_manifest(index_dir, man):
 
 
 def _idle_watchdog():
-    """Kill the embedder subprocess after IDLE_SECONDS with no requests."""
+    """Kill any warm embedder subprocess after IDLE_SECONDS with no requests.
+    All three embedders (780M search-only text_emb, 7700S ingest_emb, 7700S
+    image emb) share the same idle clock for now."""
     while True:
         time.sleep(30)
         with _lock:
-            if emb.alive and (time.time() - _last_used[0]) > IDLE_SECONDS:
-                emb.stop()   # frees VRAM + RAM -> back to cold
+            if (time.time() - _last_used[0]) > IDLE_SECONDS:
+                if text_emb.alive:
+                    text_emb.stop()
+                if ingest_emb.alive:
+                    ingest_emb.stop()
+                if emb.alive:
+                    emb.stop()   # frees VRAM + RAM -> back to cold
 
 
 threading.Thread(target=_idle_watchdog, daemon=True).start()
@@ -137,10 +210,14 @@ def list_collections() -> str:
     returned collection name as the `collection` argument to `search`."""
     lines = ["Available collections (use the name as `collection`):"]
     for name, c in COLLECTIONS.items():
-        st = stores[name]
-        srcs = st.sources()
-        lines.append(f"\n• {name} — {st.count()} chunks across {len(srcs)} file(s)"
-                     f"\n    {c['description']}")
+        ts = text_stores[name]
+        is_ = image_stores[name]
+        srcs = ts.sources()
+        img_srcs = is_.sources()
+        lines.append(
+            f"\n• {name} — {ts.count()} text chunks across {len(srcs)} file(s)"
+            f", {is_.count()} images across {len(img_srcs)} file(s)"
+            f"\n    {c['description']}")
     return "\n".join(lines)
 
 
@@ -148,15 +225,16 @@ def list_collections() -> str:
 def search(query: str, collection: str = "", k: int = 5) -> str:
     """Search a knowledge-base collection for the query and return the top-k most
     relevant passages. Pass `collection` (see `list_collections`); it may be
-    omitted only if there is a single collection. Cold-starts the embedding model
-    on the 7700S if it is not already warm (~15s the first time)."""
+    omitted only if there is a single collection. Cold-starts the small text
+    embedding model on the 780M iGPU if it is not already warm (~2-3s the first
+    time). Text-only for now; an image-search tool is goal 4's work."""
     name, store, _ = _collection(collection)
     if store.count() == 0:
-        return f"Collection {name!r} is empty. Add files to its folder or call ingest_path."
+        return f"Collection {name!r} has no text chunks. Add text/PDF/EPUB files or call ingest_path."
+    cold = _ensure_warm_text()
     with _lock:
         _touch()
-        cold = not emb.alive
-        qvec = emb.embed_text([query], is_query=True)[0]
+        qvec = text_emb.embed_text([query], is_query=True)[0]
     hits = store.search(qvec, k=k)
     _touch()
     lines = [f"Top {len(hits)} results in {name!r} for: {query!r}"
@@ -194,11 +272,14 @@ def search(query: str, collection: str = "", k: int = 5) -> str:
 def ingest_path(collection: str = "", path: str = "", recursive: bool = True) -> str:
     """Incrementally ingest a file or folder into a collection. Only NEW or
     content-CHANGED files (by hash) are (re-)embedded; deleted files are dropped.
-    PDFs are OCR'd on the 7700S first (cached by hash), then everything is
-    embedded. Safe to call repeatedly. With no `path`, reconciles the
-    collection's watched folder. This is what the file-watcher daemon calls."""
+    PDFs are OCR'd on the 7700S first (cached by hash), then text/PDF/EPUB go
+    through the small text embedder on the 780M iGPU while raster images
+    (.jpg/.jpeg/.png/.webp) go through the big VL-2B embedder on the 7700S
+    dGPU. Safe to call repeatedly. With no `path`, reconciles the collection's
+    watched folder. This is what the file-watcher daemon calls."""
     import ingest as ing            # lazy: pulls in fitz/bs4 only on ingest
-    name, store, cfg = _collection(collection)
+    name, text_store, cfg = _collection(collection)
+    image_store = _image_store(name)
     index_dir = cfg["index_dir"]
     target = path or cfg["folder"]
     if not os.path.exists(target):
@@ -211,13 +292,14 @@ def ingest_path(collection: str = "", path: str = "", recursive: bool = True) ->
         man = _load_manifest(index_dir)
         on_disk = set(files)
 
-        # decide what needs (re)ingest: new, changed hash, or stale ingest version
+        # decide what needs (re)ingest: new, changed hash, or stale ingest version.
+        # "indexed" checks BOTH stores — a file may live in either side.
         todo = []
         skipped = 0
         for f in files:
             sig = ing.file_signature(f)
             prev = man.get(f)
-            indexed = f in store.sources()
+            indexed = (f in text_store.sources()) or (f in image_store.sources())
             fresh = (prev and prev.get("hash") == sig["hash"]
                      and prev.get("iv") == INGEST_VERSION and indexed)
             if fresh:
@@ -225,17 +307,23 @@ def ingest_path(collection: str = "", path: str = "", recursive: bool = True) ->
             else:
                 todo.append((f, sig, bool(prev)))
 
-        # ---- Phase 1: OCR prepass for any PDFs that need it (embedder stopped,
-        #      OCR llama-server owns the GPU). Hold _lock so no search can
-        #      cold-start the embedder into the same VRAM.
+        # ---- Phase 1: OCR prepass for any PDFs that need it (7700S llama-
+        #      server takes over the dGPU; both 7700S embedders — image `emb`
+        #      and text `ingest_emb` — are stopped first). PDFs > MAX_OCR_PAGES
+        #      use their text layer (handled inside ocr_pages_for at embed
+        #      time, no GPU) — only short, uncached PDFs need this.
         pdfs = [(f, sig) for f, sig, _ in todo if ing.ext_kind(f) == "pdf"]
         need_ocr = [(f, sig) for f, sig in pdfs
-                    if __import__("ocr_cache").get(index_dir, sig["hash"]) is None]
+                    if __import__("ocr_cache").get(index_dir, sig["hash"]) is None
+                    and ing.pdf_page_count(f) <= ing.MAX_OCR_PAGES]
         if need_ocr:
             from ocr_client import OCRWorker
             with _lock:
                 if emb.alive:
                     emb.stop()
+                if ingest_emb.alive:
+                    ingest_emb.stop()
+                dctl.wait_for_dgpu_idle(quiet=True)
                 ocr = OCRWorker()
                 ocr.start()
                 try:
@@ -244,19 +332,43 @@ def ingest_path(collection: str = "", path: str = "", recursive: bool = True) ->
                 finally:
                     ocr.stop()           # frees the llama-server VRAM
 
-        # ---- Phase 2: embed (embedder owns the GPU)
+        # ---- Phase 2: embed, dispatching by kind. Both go through the 7700S:
+        #      Text/pdf/epub → ingest_emb + text_store
+        #      Image          → emb (VL-2B) + image_store
+        #      (780M `text_emb` is reserved for `search` — see module policy
+        #      note — never touched here.)
         added, updated, removed = [], [], []
-        warmed = False
+        warmed_text = warmed_image = False
         for f, sig, had_prev in todo:
-            if not warmed:
-                _ensure_warm(); warmed = True
-            _touch()
-            if f in store.sources():
-                store.remove_source(f)
-            op = None
-            if ing.ext_kind(f) == "pdf":
-                op, _ = ing.ocr_pages_for(f, index_dir, None)   # cache hit now
-            n, modality = ing.ingest_file(f, emb, store, ocr_pages=op)
+            kind = ing.ext_kind(f)
+            # A file might switch kinds (e.g. user replaced a .txt with a .png)
+            # or simply be a re-ingest of the same kind — either way, drop any
+            # stale rows from BOTH stores before re-embedding. remove_source
+            # is a safe no-op when the source isn't present.
+            text_store.remove_source(f)
+            image_store.remove_source(f)
+
+            if kind in ("pdf", "text", "epub"):
+                if not warmed_text:
+                    _ensure_warm_ingest_text(); warmed_text = True
+                op = None
+                if kind == "pdf":
+                    op, _ = ing.ocr_pages_for(f, index_dir, None)  # cache hit now
+                _touch()
+                n, modality = ing.ingest_file(
+                    f, text_emb=ingest_emb, image_emb=None,
+                    text_store=text_store, image_store=None, ocr_pages=op)
+            elif kind == "image":
+                if not warmed_image:
+                    _ensure_warm_image(); warmed_image = True
+                _touch()
+                n, modality = ing.ingest_file(
+                    f, text_emb=None, image_emb=emb,
+                    text_store=None, image_store=image_store)
+            else:
+                # ext_kind returned None (file type we don't handle) — shouldn't
+                # happen because supported_files filtered them out, but be safe.
+                continue
             _touch()
             man[f] = {**sig, "n": n, "modality": modality, "iv": INGEST_VERSION}
             (updated if had_prev else added).append((os.path.basename(f), n))
@@ -266,7 +378,8 @@ def ingest_path(collection: str = "", path: str = "", recursive: bool = True) ->
         # Drop any leftover image vectors + manifest entries.
         for key in list(man.keys()):
             if man[key].get("kind") == "frames":
-                store.remove_source(key)
+                text_store.remove_source(key)
+                image_store.remove_source(key)
                 man.pop(key, None)
                 removed.append(os.path.basename(key) + " (legacy frames)")
 
@@ -279,7 +392,8 @@ def ingest_path(collection: str = "", path: str = "", recursive: bool = True) ->
                     and os.path.abspath(f).startswith(tgt_abs + os.sep)
                     and not os.path.exists(f)))
             if gone:
-                store.remove_source(f)
+                text_store.remove_source(f)
+                image_store.remove_source(f)
                 man.pop(f, None)
                 removed.append(os.path.basename(f))
 
@@ -292,7 +406,8 @@ def ingest_path(collection: str = "", path: str = "", recursive: bool = True) ->
             f"  updated: {fmt(updated)}\n"
             f"  removed: {', '.join(removed) if removed else 'none'}\n"
             f"  unchanged: {skipped}\n"
-            f"  total vectors now: {store.count()}")
+            f"  total vectors now: text={text_store.count()} "
+            f"image={image_store.count()}")
 
 
 def _resolve_source(store, source):
@@ -521,18 +636,27 @@ def screenshot_video(collection: str = "", video: str = "",
 def status() -> str:
     """Report whether the embedding model is warm or cold, per-collection counts,
     the GPU device, and seconds since the last request."""
-    warm = emb.alive
+    text_warm = text_emb.alive
+    image_warm = emb.alive
     idle = time.time() - _last_used[0] if _last_used[0] else None
-    lines = [f"model: {'WARM' if warm else 'COLD'}"
-             f"{' on ' + (emb.device or '?') if warm else ''}",
+    warm_any = text_warm or image_warm
+    warm_label = []
+    if text_warm:
+        warm_label.append(f"text on {text_emb.device or '?'}")
+    if image_warm:
+        warm_label.append(f"image on {emb.device or '?'}")
+    lines = [f"model: {'WARM' if warm_any else 'COLD'}"
+             + (f" ({', '.join(warm_label)})" if warm_label else ""),
              f"idle shutdown after: {IDLE_SECONDS}s",
              f"seconds since last request: "
              f"{f'{idle:.0f}' if idle is not None else 'n/a'}",
              "collections:"]
     for name, c in COLLECTIONS.items():
-        st = stores[name]
-        lines.append(f"  • {name}: {st.count()} chunks, "
-                     f"{len(st.sources())} files  [{c['folder']}]")
+        ts = text_stores[name]
+        is_ = image_stores[name]
+        lines.append(
+            f"  • {name}: {ts.count()} text chunks / {is_.count()} images, "
+            f"{len(ts.sources()) + len(is_.sources())} files  [{c['folder']}]")
     return "\n".join(lines)
 
 

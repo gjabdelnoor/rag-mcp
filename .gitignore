@@ -13,3 +13,14 @@ venv/
 *.tmp
 *.log
 *.err
+
+# binary model weights (downloaded GGUFs; never source)
+models/
+
+# secrets / local env
+.env
+.env.*
+
+# internal AI-contract scratch (Kimi/Claude working dirs)
+kimi_kernel/
+

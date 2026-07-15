@@ -59,6 +59,7 @@ def main():
         line = line.strip()
         if not line:
             continue
+        req = {}
         try:
             req = json.loads(line)
             op = req.get("op")
@@ -90,8 +91,7 @@ def main():
         except Exception as e:
             import traceback
             log("ERROR", traceback.format_exc())
-            reply({"id": req.get("id", 0) if 'req' in dir() else 0,
-                   "ok": False, "error": str(e)})
+            reply({"id": req.get("id", 0), "ok": False, "error": str(e)})
 
 
 if __name__ == "__main__":

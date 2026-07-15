@@ -25,6 +25,10 @@ import ocr_cache
 TEXT_EXTS = {".txt", ".md", ".markdown", ".text"}
 PDF_EXTS = {".pdf"}
 EPUB_EXTS = {".epub"}
+# Image extensions — kept in sync with server.IMAGE_EXTS; the server's set is
+# the source of truth and this duplicates it only to avoid a server<->ingest
+# import cycle. If server adds a new image ext, mirror it here.
+IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp"}
 
 # Videos pushed by yt-dlpcc (`<slug>.mp4` + `<slug>.srt` + `<slug>.video.json`
 # next to the transcript) are NOT embedded: the transcript text carries the
@@ -101,6 +105,8 @@ def ext_kind(path):
         return "text"
     if e in EPUB_EXTS:
         return "epub"
+    if e in IMAGE_EXTS:
+        return "image"
     return None
 
 
@@ -129,31 +135,76 @@ def file_hash(path):
     return file_signature(path)["hash"]
 
 
+# PDFs longer than this skip Surya OCR entirely and use their embedded text
+# layer instead (books/papers have one; OCR is for short scans/slides).
+MAX_OCR_PAGES = int(os.environ.get("RAG_MAX_OCR_PAGES", "20"))
+
+
+def pdf_page_count(path):
+    with fitz.open(path) as doc:
+        return doc.page_count
+
+
+def pdf_text_pages(path):
+    """Extract the embedded text layer per page, same shape as OCR output
+    (list of {"page", "html"}). Pages with no text layer come out empty and
+    are simply not embedded."""
+    with fitz.open(path) as doc:
+        return [{"page": i + 1, "html": doc[i].get_text().strip()}
+                for i in range(doc.page_count)]
+
+
+def pdf_needs_ocr_worker(path, index_dir):
+    """True if ingesting this PDF would actually run the OCR model: not in
+    the cache AND short enough to OCR (> MAX_OCR_PAGES uses the text layer)."""
+    if ocr_cache.get(index_dir, file_hash(path)) is not None:
+        return False
+    return pdf_page_count(path) <= MAX_OCR_PAGES
+
+
 def ocr_pages_for(path, index_dir, ocr_worker, dpi=150):
-    """Return the per-page OCR for a PDF (list of {"page", "html"}), using the
-    cache when possible and running the OCR worker (and caching the result) on
-    a miss. Requires a live `ocr_worker` only on a cache miss."""
+    """Return the per-page text for a PDF (list of {"page", "html"}), using the
+    cache when possible. On a miss, PDFs with more than MAX_OCR_PAGES pages get
+    their embedded text layer extracted (no GPU); shorter ones are OCR'd by the
+    worker. Both results are cached by file hash. Requires a live `ocr_worker`
+    only on a cache miss for a short PDF."""
     h = file_hash(path)
     pages = ocr_cache.get(index_dir, h)
     if pages is not None:
         return pages, True                       # cache hit
+    if pdf_page_count(path) > MAX_OCR_PAGES:
+        pages = pdf_text_pages(path)
+        ocr_cache.put(index_dir, h, pages,
+                      meta={"source": path, "method": "textlayer"})
+        return pages, False                      # text layer, no OCR
     if ocr_worker is None:
         raise RuntimeError(f"OCR needed for {os.path.basename(path)} but no OCR "
                            f"worker available")
     pages = ocr_worker.ocr_pdf(path, dpi=dpi)
     ocr_cache.put(index_dir, h, pages,
-                  meta={"source": path, "dpi": dpi})
+                  meta={"source": path, "dpi": dpi, "method": "ocr"})
     return pages, False                          # freshly OCR'd
 
 
-def ingest_file(path, emb, store, ocr_pages=None, dpi=150, chunk=1200):
-    """Embed one file and append to the store. Returns (n_chunks, modality).
-    For PDFs, `ocr_pages` (list of {"page","html"}) MUST be supplied. The caller
-    is responsible for remove_source() first when re-ingesting."""
+def ingest_file(path, text_emb=None, image_emb=None,
+                 text_store=None, image_store=None,
+                 ocr_pages=None, dpi=150, chunk=1200):
+    """Embed one file and append to the appropriate store. Returns
+    (n_chunks, modality). Dispatched by file kind:
+      * pdf / text / epub -> `text_emb.embed_text(...)` -> `text_store`
+        (PDF requires `ocr_pages` to already be supplied — list of
+        {"page","html"} — exactly like before)
+      * image               -> `image_emb.embed_image([path])` -> `image_store`,
+        appending 1 vector with meta {"source": path, "modality": "image"}
+    Caller is responsible for `remove_source` on BOTH stores before calling
+    when re-ingesting. Pass only the embedder+store pair relevant to the kind:
+    ingest_file raises ValueError if the other pair is missing."""
     kind = ext_kind(path)
     if kind == "pdf":
         if ocr_pages is None:
             raise RuntimeError("ingest_file: PDF requires ocr_pages")
+        if text_emb is None or text_store is None:
+            raise ValueError("ingest_file: pdf kind needs text_emb + text_store")
         metas = []
         for pg in ocr_pages:
             html = (pg.get("html") or "").strip()
@@ -165,10 +216,12 @@ def ingest_file(path, emb, store, ocr_pages=None, dpi=150, chunk=1200):
         n, B = 0, 16
         for i in range(0, len(metas), B):
             batch = metas[i:i+B]
-            store.append(emb.embed_text([m["text"] for m in batch]), batch)
+            text_store.append(text_emb.embed_text([m["text"] for m in batch]), batch)
             n += len(batch)
         return n, "ocr"
     if kind in ("text", "epub"):
+        if text_emb is None or text_store is None:
+            raise ValueError("ingest_file: text/epub kind needs text_emb + text_store")
         if kind == "text":
             with open(path, errors="ignore") as f:
                 chunks = chunk_text(f.read(), chunk)
@@ -182,9 +235,17 @@ def ingest_file(path, emb, store, ocr_pages=None, dpi=150, chunk=1200):
         n, B = 0, 16
         for i in range(0, len(metas), B):
             batch = metas[i:i+B]
-            store.append(emb.embed_text([m["text"] for m in batch]), batch)
+            text_store.append(text_emb.embed_text([m["text"] for m in batch]), batch)
             n += len(batch)
         return n, "text"
+    if kind == "image":
+        if image_emb is None or image_store is None:
+            raise ValueError("ingest_file: image kind needs image_emb + image_store")
+        # image_emb.embed_image returns shape (n, dim) float32 L2-normalized.
+        vecs = image_emb.embed_image([path])
+        meta = {"source": path, "modality": "image"}
+        image_store.append(vecs, [meta])
+        return 1, "image"
     return 0, None
 
 
@@ -199,53 +260,97 @@ def main():
     ap.add_argument("--chunk", type=int, default=1200)
     args = ap.parse_args()
 
-    store = IndexStore(args.index)
+    text_store = IndexStore(os.path.join(args.index, "text"))
+    image_store = IndexStore(os.path.join(args.index, "image"))
     if args.reset:
-        store.reset()
+        text_store.reset()
+        image_store.reset()
 
     files = supported_files(args.folder)
     print(f"found {len(files)} ingestable file(s) under {args.folder}")
     if not files:
         print("nothing to ingest."); return
     pdfs = [f for f in files if ext_kind(f) == "pdf"]
+    images = [f for f in files if ext_kind(f) == "image"]
 
-    # ---- Phase 1: OCR prepass (GPU owned by llama-server; embedder NOT loaded)
+    # ---- Phase 1: OCR prepass (GPU owned by llama-server; VL-2B embedder
+    #      stopped because it shares the dGPU)
     ocr = None
     if pdfs:
-        from ocr_client import OCRWorker
-        ocr = OCRWorker(dpi=args.dpi)
-        print(f"OCR prepass for {len(pdfs)} PDF(s) on {ocr.llama} ...")
+        # Only launch the OCR llama-server if some PDF actually needs OCR
+        # (cache miss AND <= MAX_OCR_PAGES); long PDFs use their text layer.
+        if any(pdf_needs_ocr_worker(f, args.index) for f in pdfs):
+            from ocr_client import OCRWorker
+            ocr = OCRWorker(dpi=args.dpi)
+            print(f"OCR prepass for {len(pdfs)} PDF(s) on {ocr.llama} ...")
+        else:
+            print(f"text prepass for {len(pdfs)} PDF(s) (no OCR needed) ...")
         t0 = time.time()
         for f in pdfs:
             _, hit = ocr_pages_for(f, args.index, ocr, dpi=args.dpi)
-            print(f"  [ocr{'/cache' if hit else ''}] {os.path.basename(f)}")
-        ocr.stop()                               # frees the llama-server VRAM
-        print(f"  OCR prepass done in {time.time()-t0:.1f}s")
+            print(f"  [pdf{'/cache' if hit else ''}] {os.path.basename(f)}")
+        if ocr:
+            ocr.stop()                           # frees the llama-server VRAM
+        print(f"  PDF prepass done in {time.time()-t0:.1f}s")
 
-    # ---- Phase 2: embed everything (embedder owns the GPU)
-    emb = Embedder()
+    # ---- Phase 2: embed text-ish files with the small text embedder on the
+    # 7700S (xlarge preset). The 780M iGPU is reserved for search-query
+    # inference only — see server.py's module docstring for the policy.
+    text_files = [f for f in files if ext_kind(f) in ("pdf", "text", "epub")]
     t_start = time.time()
-    print("cold-starting embedder (loading model on 7700S)...")
-    t0 = time.time(); emb.start()
-    print(f"  model ready in {time.time()-t0:.1f}s on {emb.device}")
+    if text_files:
+        import dgpu_embed_ctl as dctl
+        dctl.wait_for_dgpu_idle()
+        text_emb = dctl._make_embedder("xlarge", dctl.DEFAULT_PORT)
+        print(f"cold-starting text embedder on 7700S/xlarge ({len(text_files)} file(s))...")
+        t0 = time.time(); text_emb.start()
+        print(f"  text embedder ready in {time.time()-t0:.1f}s on {text_emb.device}")
 
-    n_total = 0
-    for path in files:
-        store.remove_source(path)                # idempotent re-ingest
-        op = None
-        if ext_kind(path) == "pdf":
-            op, _ = ocr_pages_for(path, args.index, None, dpi=args.dpi)
-        t0 = time.time()
-        n, modality = ingest_file(path, emb, store, ocr_pages=op,
-                                  dpi=args.dpi, chunk=args.chunk)
-        n_total += n
-        print(f"  [{modality}] {os.path.basename(path)}: {n} chunks "
-              f"({time.time()-t0:.1f}s)")
+        n_text = 0
+        for path in text_files:
+            text_store.remove_source(path)        # idempotent re-ingest
+            op = None
+            if ext_kind(path) == "pdf":
+                op, _ = ocr_pages_for(path, args.index, None, dpi=args.dpi)
+            t0 = time.time()
+            n, modality = ingest_file(path, text_emb=text_emb, image_emb=None,
+                                      text_store=text_store, image_store=None,
+                                      ocr_pages=op, dpi=args.dpi, chunk=args.chunk)
+            n_text += n
+            print(f"  [{modality}] {os.path.basename(path)}: {n} chunks "
+                  f"({time.time()-t0:.1f}s)")
+        text_emb.stop()
+    else:
+        n_text = 0
 
-    emb.stop()
+    # ---- Phase 3: embed raster images with the big VL-2B on 7700S
+    if images:
+        emb = Embedder()
+        print(f"cold-starting image embedder (VL-2B) on 7700S "
+              f"({len(images)} file(s))...")
+        t0 = time.time(); emb.start()
+        print(f"  image embedder ready in {time.time()-t0:.1f}s on {emb.device}")
+
+        n_images = 0
+        for path in images:
+            image_store.remove_source(path)
+            t0 = time.time()
+            n, modality = ingest_file(path, text_emb=None, image_emb=emb,
+                                      text_store=None, image_store=image_store)
+            n_images += n
+            print(f"  [{modality}] {os.path.basename(path)}: {n} vectors "
+                  f"({time.time()-t0:.1f}s)")
+        emb.stop()
+    else:
+        n_images = 0
+
     print("-" * 56)
-    print(f"ingested {n_total} chunks across {len(files)} file(s) "
-          f"= {store.count()} vectors total")
+    print(f"ingested {n_text} text chunks + {n_images} images across "
+          f"{len(files)} file(s)")
+    print(f"  text store: {text_store.count()} vectors  "
+          f"({len(text_store.sources())} files)")
+    print(f"  image store: {image_store.count()} vectors  "
+          f"({len(image_store.sources())} files)")
     print(f"wall time (incl load): {time.time()-t_start:.1f}s")
 
 

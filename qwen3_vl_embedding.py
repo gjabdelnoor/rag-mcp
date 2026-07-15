@@ -125,7 +125,7 @@ def sample_frames(frames: List[Union[str, Image.Image]], num_segments: int, max_
     for frame_idx in frame_id_list:
         try:
             sampled_frames.append(frames[frame_idx])
-        except:
+        except IndexError:
             break
     # Ensure the sampled list meets the required segment count
     while len(sampled_frames) < num_segments:
