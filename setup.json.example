@@ -1,18 +1,19 @@
 {
-  "schema": 1,
+  "schema": 2,
   "preset": "medium",
   "detected": {
     "cpu_tflops_fp32": 0.42,
     "gpus": [
       {
         "vendor": "amd",
-        "name": "Radeon RX 7700S",
-        "vram_gb": 8.0,
+        "name": "AMD Radeon RX 7700S",
+        "vram_gb": 7.98,
+        "tflops_fp16": 23.6,
         "tflops_fp32": 11.8,
         "raw_query": "card0"
       }
     ],
-    "best_gpu": "Radeon RX 7700S"
+    "best_gpu": "AMD Radeon RX 7700S"
   },
   "warned_large": false,
   "ts": "2026-07-15T10:30:00Z"

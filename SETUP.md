@@ -18,16 +18,19 @@ embedder (or just `python server.py` if you picked `medium`).
 
 ## The tiers
 
-| preset | model | dim | needs | supports images |
+| preset | model | dim | needs (FP16 / VRAM) | supports images |
 |---|---|---|---|---|
-| `tiny`  | sentence-transformers/all-MiniLM-L6-v2 (22M) | 384  | any CPU or GPU           | no  |
-| `small` | nomic-embed-text-v1.5 (137M, GGUF)            | 768  | ~1 TFLOPs FP32, 4 GB VRAM | no  |
-| `medium`| Qwen3-VL-Embedding-2B (2B)                   | 2048 | ~10 TFLOPs FP32, 6 GB     | yes |
-| `large` | Qwen3-VL-Embedding-8B (8B, 8-bit)            | 4096 | ~13 TFLOPs FP32, 12 GB    | no  |
+| `tiny`  | sentence-transformers/all-MiniLM-L6-v2 (22M) | 384  | 0 / 0 GB               | no  |
+| `small` | nomic-embed-text-v1.5 (137M, GGUF)            | 768  | ~2 FP16, 4 GB          | no  |
+| `medium`| Qwen3-VL-Embedding-2B (2B)                   | 2048 | ~20 FP16, 6 GB         | yes |
+| `large` | Qwen3-VL-Embedding-8B (8B, 8-bit)            | 4096 | ~25 FP16, 12 GB        | no  |
 
 The "needs" column is the floor; the picker takes the highest tier the host
-satisfies. `large` additionally prints a warning — its quality gain over
-`medium` is **marginal** for typical knowledge bases (textbooks, papers,
+satisfies. **FP16 TFLOPs are tensor-core / matrix throughput**, not the
+shader/CUDA FP32 number — those are roughly half of these (e.g. an RTX 3060
+is 13 FP32 but 25.6 FP16 tensor, and that's the relevant figure for an
+embedding workload). `large` additionally prints a warning — its quality gain
+over `medium` is **marginal** for typical knowledge bases (textbooks, papers,
 notes) and only meaningful on very complex / domain-specific corpora.
 
 ## What the diagnostic does
@@ -38,12 +41,15 @@ notes) and only meaningful on very complex / domain-specific corpora.
 2. `rocm-smi --showproductname --showmeminfo vram --json` — AMD GPUs.
 3. `sysctl` + `system_profiler` — Apple Silicon (best-effort).
 4. `lspci -mm` — last-resort fallback (no TFLOPs available).
-5. A 2-second numpy matmul (1024³ FP32) for the CPU benchmark.
+5. A 2-second numpy matmul (1024³ FP32) for the CPU benchmark. The picker
+   halves this for the CPU fallback since x86 consumer CPUs don't have FP16
+   SIMD.
 
-Each GPU is matched against a static device→TFLOPs table
-(`device_probe.NVIDIA_TFLOPS_FP32`, `AMD_TFLOPS_FP32`, `APPLE_TFLOPS_FP32`).
-Unknown devices get `tflops_fp32=None` and the picker conservatively drops
-them to `small`.
+Each GPU is matched against a static device→FP16 TFLOPs table
+(`device_probe.NVIDIA_TFLOPS_FP16`, `AMD_TFLOPS_FP16`, `APPLE_TFLOPS_FP16`).
+The probe output also includes `tflops_fp32` (computed as half of FP16) for
+reference. Unknown devices get `tflops_fp16=None` and the picker
+conservatively drops them to `small`.
 
 The probe takes ~2 seconds total (the CPU benchmark dominates). On a headless
 laptop with no GPU, you get a CPU TFLOPS estimate and the picker lands on

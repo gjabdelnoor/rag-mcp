@@ -42,12 +42,16 @@ Modified:
 
 ## The four tiers
 
-| preset | model | dim | needs (min TFLOPs FP32 / VRAM) | supports images |
+| preset | model | dim | needs (min FP16 TFLOPs / VRAM) | supports images |
 |---|---|---|---|---|
 | `tiny`  | sentence-transformers/all-MiniLM-L6-v2 | 384  | 0.0 / 0 GB    | no  |
-| `small` | nomic-embed-text-v1.5 (existing)        | 768  | 1.0 / 4 GB    | no  |
-| `medium`| Qwen3-VL-Embedding-2B (existing)        | 2048 | 10.0 / 6 GB   | yes |
-| `large` | Qwen3-VL-Embedding-8B (8-bit)           | 4096 | 13.0 / 12 GB  | no  |
+| `small` | nomic-embed-text-v1.5 (existing)        | 768  | 2.0 / 4 GB    | no  |
+| `medium`| Qwen3-VL-Embedding-2B (existing)        | 2048 | 20.0 / 6 GB   | yes |
+| `large` | Qwen3-VL-Embedding-8B (8-bit)           | 4096 | 25.0 / 12 GB  | no  |
+
+FP16 = tensor-core / matrix throughput. FP32 (shader/CUDA-core) is roughly
+half of these and is NOT what we size against — an RTX 3060 is 13 FP32 but
+25.6 FP16 tensor, and the latter is what an embedding workload runs on.
 
 Image side of `large`: still uses VL-2B. The 8B gain is on text only.
 
@@ -55,19 +59,20 @@ Image side of `large`: still uses VL-2B. The 8B gain is on text only.
 
 ```python
 def pick(detected):
-    gpus = [g for g in detected["gpus"] if isinstance(g.get("tflops_fp32"), (int, float))]
-    best = max(gpus, key=lambda g: g["tflops_fp32"]) if gpus else None
-    tflops = best["tflops_fp32"] if best else (detected["cpu_tflops_fp32"] or 0.0)
+    gpus = [g for g in detected["gpus"] if isinstance(g.get("tflops_fp16"), (int, float))]
+    best = max(gpus, key=lambda g: g["tflops_fp16"]) if gpus else None
+    tflops = best["tflops_fp16"] if best else ((detected["cpu_tflops_fp32"] or 0.0) / 2.0)
     vram = best["vram_gb"] if best else 0.0
     for name in ("large", "medium", "small", "tiny"):
         p = PRESETS[name]
-        if tflops >= p["min_tflops_fp32"] and vram >= p["min_vram_gb"]:
+        if tflops >= p["min_tflops_fp16"] and vram >= p["min_vram_gb"]:
             return name
     return "tiny"
 ```
 
-Picks the highest preset whose `min_tflops_fp32` AND `min_vram_gb` are both
-met. Floor is always `tiny`.
+Picks the highest preset whose `min_tflops_fp16` AND `min_vram_gb` are both
+met. CPU fallback halves the FP32 numpy benchmark as a rough proxy for FP16
+throughput. Floor is always `tiny`.
 
 ## Why no server.py changes
 

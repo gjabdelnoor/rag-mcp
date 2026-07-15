@@ -31,7 +31,7 @@ import device_probe as dp
 
 
 SETUP_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "setup.json")
-SCHEMA = 1
+SCHEMA = 2                                # bumped: probe now reports FP16 + FP32
 
 
 def _load_setup() -> dict | None:
@@ -56,9 +56,15 @@ def _humanize_gpu(detected: dict) -> str:
         return "GPU: none detected"
     lines = []
     for g in gpus:
+        fp16 = g.get("tflops_fp16")
+        fp32 = g.get("tflops_fp32")
+        if fp16:
+            tflops_s = f"{fp16} FP16 / {fp32} FP32" if fp32 else f"{fp16} FP16"
+        else:
+            tflops_s = "unknown"
         lines.append(
             f"GPU: {g['name']} ({g['vendor']}) — {g['vram_gb']} GB VRAM, "
-            f"{g.get('tflops_fp32') or 'unknown'} TFLOPS FP32"
+            f"{tflops_s} TFLOPS"
         )
     return "\n".join(lines)
 
@@ -66,7 +72,7 @@ def _humanize_gpu(detected: dict) -> str:
 def _print_hardware(detected: dict) -> None:
     cpu = detected.get("cpu_tflops_fp32")
     print("Detected hardware:")
-    print(f"  CPU:    ~{cpu} TFLOPS FP32 (numpy matmul, 2 s budget)")
+    print(f"  CPU:    ~{cpu} TFLOPS FP32 (~halved for FP16, numpy matmul, 2 s budget)")
     print(_humanize_gpu(detected))
 
 
@@ -278,7 +284,8 @@ def cmd_setup(args) -> int:
             "best_gpu": detected.get("best_gpu"),
         },
         "warned_large": (chosen == "large"),
-        "ts": _dt.datetime.now(_dt.timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
+        "ts": _dt.datetime.now(_dt.timezone.utc).isoformat(timespec="seconds")
+              .replace("+00:00", "Z"),
     }
     _save_setup(payload)
     print(f"\nwrote {SETUP_PATH}  (preset={chosen!r})")
