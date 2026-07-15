@@ -1,6 +1,7 @@
 # built index + caches (generated data, not source)
 index/
 collections.json
+setup.json
 
 # python
 __pycache__/

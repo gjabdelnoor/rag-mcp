@@ -7,6 +7,15 @@ index and a human description. The server is thin — `mcp + numpy only, no
 torch` at idle — and runs the heavy models in cold-spawned child
 subprocesses that are killed after 15 min idle.
 
+## First-time setup
+
+rag-mcp has four embedding tiers (`tiny` / `small` / `medium` / `large`) and
+the right one depends on your hardware. Run `python setup.py` once — it
+probes the host (torch-free: `nvidia-smi` / `rocm-smi` / `lspci` + a 2-second
+numpy CPU benchmark), recommends a tier, and prints the right startup
+command. See **[`SETUP.md`](./SETUP.md)** for the full tier table, override
+flags, and the destructive preset-switch workflow.
+
 Three embedding models, one shared lock — see `server.py`'s policy note for
 why:
 
@@ -121,11 +130,15 @@ journalctl --user -u rag-mcp.service -f
 | file | role |
 |------|------|
 | `server.py` | MCP server; tools + lazy load + idle watchdog + dual-phase ingest |
+| `setup.py` | first-time setup: probe + picker + write `setup.json` |
+| `device_probe.py` | torch-free GPU/CPU probe + TFLOPs table + preset picker |
+| `tiny_embedder_worker.py` / `tiny_embedder_client.py` | sentence-transformers backend (`tiny` preset) |
+| `large_embedder_worker.py` / `large_embedder_client.py` | VL-8B 8-bit backend (`large` preset) |
 | `embedder_worker.py` | subprocess that loads the VL-2B on the 7700S (only torch file) |
 | `qwen3_vl_embedding.py` | vendored official Qwen3-VL embedder (correct weight loading) |
 | `worker_client.py` | spawns/kills the VL-2B worker, JSON-lines protocol |
 | `text_embedder_client.py` | thin client for the small `nomic-embed` llama-server |
-| `dgpu_embed_ctl.py` | CLI to start/stop/bench the 7700S `nomic` embedder; presets |
+| `dgpu_embed_ctl.py` | CLI to start/stop/bench the 7700S `nomic` embedder; ctx/batch presets |
 | `ocr_worker.py` | subprocess running Surya-2 OCR via the Vulkan llama-server |
 | `ocr_client.py` | spawns/kills the OCR worker, remote→GPU→CPU fallback, orphan reaper |
 | `ocr_cache.py` | OCR results cached by file hash |
@@ -133,6 +146,8 @@ journalctl --user -u rag-mcp.service -f
 | `ingest.py` | CLI + reusable `ingest_file`/`ocr_pages_for`/`file_signature` |
 | `rag_collections.py` | collection config loader |
 | `watcher.py` | event-driven multi-folder ingester daemon |
+| `SETUP.md` | tier table, diagnostic, per-preset startup commands, migration story |
+| `setup.json.example` | schema skeleton for the gitignored `setup.json` |
 | `kimi_contracts/` | internal AI-contract docs for the dual-store refactor (kept for transparency; not user-facing) |
 | `index/<name>/{text,image}/` | per-collection dual-store index (vectors + meta + manifest + ocr_cache) |
 

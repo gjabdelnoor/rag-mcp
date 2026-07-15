@@ -30,7 +30,9 @@ DEFAULT_PORT = 8092
 PIDFILE_TMPL = "/tmp/dgpu_embed_{port}.json"
 
 # ctx == batch == ubatch unless noted; parallel = physical batch "slots".
-PRESETS = {
+# Named CTX_PRESETS to avoid collision with device_probe.PRESETS (the
+# model-tier ladder: tiny/small/medium/large).
+CTX_PRESETS = {
     "small":   dict(ctx=2048,  batch=2048,  ubatch=2048,  parallel=1),
     "medium":  dict(ctx=4096,  batch=4096,  ubatch=4096,  parallel=1),
     "large":   dict(ctx=8192,  batch=8192,  ubatch=8192,  parallel=1),
@@ -51,7 +53,7 @@ def _dgpu_env():
 
 
 def _make_embedder(preset, port):
-    p = PRESETS[preset]
+    p = CTX_PRESETS[preset]
     return TextEmbedder(
         model_path=DEFAULT_MODEL_PATH, port=port, pooling=DEFAULT_POOLING,
         ctx_size=p["ctx"], batch_size=p["batch"], ubatch_size=p["ubatch"],
@@ -131,7 +133,7 @@ def cmd_start(args):
         wait_for_dgpu_idle()
     emb = _make_embedder(args.preset, args.port)
     print(f"starting 7700S text embedder: preset={args.preset} "
-          f"({PRESETS[args.preset]}) port={args.port} ...")
+          f"({CTX_PRESETS[args.preset]}) port={args.port} ...")
     t0 = time.time()
     emb.start()
     _write_pidfile(args.port, emb.proc.pid, args.preset)
@@ -169,7 +171,7 @@ def cmd_status(args):
         return
     idle = time.time() - info["started"]
     print(f"port {args.port}: WARM  preset={info['preset']} "
-          f"{PRESETS[info['preset']]}  pid={info['pid']}  up {idle:.0f}s")
+          f"{CTX_PRESETS[info['preset']]}  pid={info['pid']}  up {idle:.0f}s")
 
 
 def _sample_texts(n, sample_dir=None):
@@ -220,7 +222,7 @@ def _run_bench(preset, port, n, concurrency=1, sample_dir=None):
             list(ex.map(emb.embed_text, batches))
     elapsed = time.time() - t0
     rate = len(texts) / elapsed if elapsed > 0 else 0.0
-    print(f"  preset={preset:8s} conc={concurrency:2d} {str(PRESETS[preset]):55s} "
+    print(f"  preset={preset:8s} conc={concurrency:2d} {str(CTX_PRESETS[preset]):55s} "
           f"boot={boot_s:5.1f}s  {len(texts)} chunks in {elapsed:5.1f}s "
           f"-> {rate:6.1f} chunks/s")
     _write_pidfile(port, emb.proc.pid, preset)
@@ -242,8 +244,8 @@ def cmd_bench_all(args):
           f"stops+restarts the server per combo since batch/ubatch/parallel "
           f"are launch-time flags ...")
     results = {}
-    for preset in PRESETS:
-        for conc in sorted({1, PRESETS[preset]["parallel"]}):
+    for preset in CTX_PRESETS:
+        for conc in sorted({1, CTX_PRESETS[preset]["parallel"]}):
             info = _read_pidfile(args.port)
             if info and _proc_alive(info["pid"]):
                 cmd_stop(args)
@@ -268,14 +270,14 @@ def main():
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     p = sub.add_parser("start"); p.add_argument("--preset", default="large",
-                                                 choices=PRESETS)
+                                                 choices=CTX_PRESETS)
     p.add_argument("--no-wait", action="store_true",
                    help="skip waiting for the 7700S to be idle before launch")
     p.set_defaults(fn=cmd_start)
     p = sub.add_parser("stop"); p.set_defaults(fn=cmd_stop)
     p = sub.add_parser("status"); p.set_defaults(fn=cmd_status)
     p = sub.add_parser("bench"); p.add_argument("--preset", default="large",
-                                                 choices=PRESETS)
+                                                 choices=CTX_PRESETS)
     p.add_argument("--n", type=int, default=200)
     p.add_argument("--concurrency", type=int, default=1)
     p.set_defaults(fn=cmd_bench)

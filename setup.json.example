@@ -1,0 +1,19 @@
+{
+  "schema": 1,
+  "preset": "medium",
+  "detected": {
+    "cpu_tflops_fp32": 0.42,
+    "gpus": [
+      {
+        "vendor": "amd",
+        "name": "Radeon RX 7700S",
+        "vram_gb": 8.0,
+        "tflops_fp32": 11.8,
+        "raw_query": "card0"
+      }
+    ],
+    "best_gpu": "Radeon RX 7700S"
+  },
+  "warned_large": false,
+  "ts": "2026-07-15T10:30:00Z"
+}

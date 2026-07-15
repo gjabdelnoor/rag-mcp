@@ -135,8 +135,8 @@ def sample_frames(frames: List[Union[str, Image.Image]], num_segments: int, max_
 # Define embedder class for processing inputs and generating embeddings
 class Qwen3VLEmbedder():
     def __init__(
-        self, 
-        model_name_or_path: str, 
+        self,
+        model_name_or_path: str,
         max_length: int = MAX_LENGTH,
         min_pixels: int = MIN_PIXELS,
         max_pixels: int = MAX_PIXELS,
@@ -145,9 +145,11 @@ class Qwen3VLEmbedder():
         num_frames: int = MAX_FRAMES,
         max_frames: int = MAX_FRAMES,
         default_instruction: str = "Represent the user's input.",
+        device: str | None = None,
         **kwargs
     ):
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        if device is None:
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         self.max_length = max_length
         self.min_pixels = min_pixels
@@ -161,7 +163,13 @@ class Qwen3VLEmbedder():
 
         self.model = Qwen3VLForEmbedding.from_pretrained(
             model_name_or_path, trust_remote_code=True, **kwargs
-        ).to(device)
+        )
+        # If the caller supplied a `quantization_config` (bitsandbytes) or
+        # already moved the model to a device via `device_map="auto"`, skip the
+        # naive `.to(device)` — both paths have already placed the tensors.
+        if not (kwargs.get("quantization_config") is not None
+                or kwargs.get("device_map") is not None):
+            self.model = self.model.to(device)
         self.processor = Qwen3VLProcessor.from_pretrained(
             model_name_or_path, padding_side='right'
         )
